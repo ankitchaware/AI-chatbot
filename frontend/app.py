@@ -1,7 +1,3 @@
-"""
-Streamlit Frontend for NABARD Chatbot
-Interactive UI for querying NABARD Annual Reports
-"""
 import sys
 import os
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

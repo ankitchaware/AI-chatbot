@@ -1,10 +1,5 @@
-"""
-PDF Ingestion Pipeline for NABARD Annual Reports
-Extracts text, chunks it, and creates vector embeddings
-"""
 import sys
 import os
-
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
@@ -17,54 +12,49 @@ except ImportError:
     HAS_CAMELOT = False
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 from backend.vector_store import create_vector_store
 
 
-def extract_tables_to_text(pdf_path: str) -> str:
+def extract_tables_to_text(pdf_path: str, page_num: int = None) -> str:
     """
-    Extract tables from a PDF using Camelot and return them as plain text.
-    Falls back silently if Camelot or its dependencies are missing.
+    Extract tables with better formatting and structure preservation.
     """
     if not HAS_CAMELOT:
         print("Camelot not installed; skipping table extraction.")
         return ""
 
     try:
-        tables = camelot.read_pdf(pdf_path, pages="all", flavor="lattice")
+        page_spec = str(page_num) if page_num else "all"
+        tables = camelot.read_pdf(pdf_path, pages=page_spec, flavor="lattice")
         if tables.n == 0:
-            tables = camelot.read_pdf(pdf_path, pages="all", flavor="stream")
+            tables = camelot.read_pdf(pdf_path, pages=page_spec, flavor="stream")
 
         extracted_tables = []
         for idx, table in enumerate(tables):
-            print(f"   Extracting table {idx + 1}/{tables.n} from {os.path.basename(pdf_path)}")
             df = table.df
-            rows = [", ".join(row) for row in df.values.tolist()]
-            extracted_tables.append("\n".join(rows))
+            table_text = f"TABLE {idx + 1}:\n"
+            table_text += df.to_string(index=False)
+            extracted_tables.append(table_text)
 
-        joined_tables = "\n\n".join(extracted_tables)
-        if joined_tables:
-            print(f"   ✓ Extracted tables text length: {len(joined_tables):,} chars")
-        return joined_tables
+        return "\n\n".join(extracted_tables)
 
     except Exception as e:
-        print(f"   ✗ Table extraction skipped for {os.path.basename(pdf_path)}: {e}")
+        print(f"Table extraction error: {e}")
         return ""
 
 def extract_text_from_pdfs():
     """
-    Extract text from all PDF files in data/raw_pdfs/
-    
-    Returns:
-        Combined text from all PDFs
+    Extract text with metadata preservation (page numbers, filenames).
+    Returns list of Document objects instead of plain text.
     """
-    all_text = ""
+    all_documents = []
     pdf_folder = os.path.join(project_root, "data", "raw_pdfs")
     
     if not os.path.exists(pdf_folder):
-        print(f"PDF folder not found: {pdf_folder}")
         raise FileNotFoundError(f"PDF folder not found: {pdf_folder}")
     
-    pdf_files = [f for f in os.listdir(pdf_folder) if f.lower().endswith(".pdf")]
+    pdf_files = sorted([f for f in os.listdir(pdf_folder) if f.lower().endswith(".pdf")])
     
     if not pdf_files:
         raise FileNotFoundError(f"No PDF files found in {pdf_folder}")
@@ -72,91 +62,93 @@ def extract_text_from_pdfs():
     print(f"Found {len(pdf_files)} PDF file(s)")
     
     for filename in pdf_files:
-        print(f"\nProcessing file: {filename}")
+        print(f"\nProcessing: {filename}")
         path = os.path.join(pdf_folder, filename)
-        print(f"Extracting: {filename}...")
         
         try:
             with pdfplumber.open(path) as pdf:
-                print(f"   Total pages: {len(pdf.pages)}")
+                print(f"Total pages: {len(pdf.pages)}")
+                
                 for page_num, page in enumerate(pdf.pages, 1):
                     text = page.extract_text()
-                    if text:
-                        all_text += text + "\n\n"
+                    if not text:
+                        continue                  
+                    table_text = extract_tables_to_text(path, page_num)
+                    
+                    full_page_content = text
+                    if table_text:
+                        full_page_content += f"\n\n{table_text}"                   
+                    doc = Document(
+                        page_content=full_page_content,
+                        metadata={
+                            "source": filename,
+                            "page": page_num,
+                            "total_pages": len(pdf.pages)
+                        }
+                    )
+                    all_documents.append(doc)
                     
                     if page_num % 10 == 0:
-                        print(f"   Processed {page_num} pages...")
+                        print(f"Processed {page_num} pages...")
 
-            # Append table text (if any) after full PDF text extraction
-            table_text = extract_tables_to_text(path)
-            if table_text:
-                all_text += table_text + "\n\n"
-
-            print(f"✓ Completed: {filename}")
+            print(f"Completed: {filename}")
             
         except Exception as e:
-            print(f"✗ Error processing {filename}: {e}")
+            print(f"Error processing {filename}: {e}")
             continue
     
-    print(f"\n✓ Total extracted text: {len(all_text):,} characters")
-    return all_text
+    print(f"\nTotal documents created: {len(all_documents)}")
+    return all_documents
 
-def chunk_text(text):
-    print("Chunking text into smaller pieces...")
+
+def chunk_documents(documents):
     """
-    Split text into overlapping chunks for better retrieval
-    
-    Args:
-        text: Combined text from all PDFs
-    
-    Returns:
-        List of text chunks
+    Improved chunking with larger size and better overlap.
+    Preserves metadata through the chunking process.
     """
+    print("Chunking documents with improved parameters...")
+    
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
+        chunk_size=2000,  
+        chunk_overlap=400,  
         length_function=len,
-        separators=["\n\n", "\n", " ", ""]
+        separators=["\n\n\n", "\n\n", "\n", ". ", " ", ""],
+        add_start_index=True
     )
     
-    chunks = splitter.split_text(text)
-    print(f"✓ Created {len(chunks)} chunks")
+    chunks = splitter.split_documents(documents)
+    
+    print(f"Created {len(chunks)} chunks (avg size: {sum(len(c.page_content) for c in chunks) // len(chunks)} chars)")
     
     return chunks
 
-def main():
 
-    """Main ingestion pipeline"""
+def main():
+    """Enhanced ingestion pipeline"""
     print("=" * 60)
-    print("NABARD Reports Ingestion Pipeline")
+    print("NABARD Reports - Enhanced Ingestion Pipeline")
     print("=" * 60)
     
     try:
-        combined_text = extract_text_from_pdfs()
+        documents = extract_text_from_pdfs()
         
-        if not combined_text.strip():
-            raise ValueError("No text extracted from PDFs!")
-        
-        chunks = chunk_text(combined_text)
+        if not documents:
+            raise ValueError("No documents extracted from PDFs!")
+        chunks = chunk_documents(documents)       
         create_vector_store(chunks)
         
         print("\n" + "=" * 60)
-        print("✓ INGESTION COMPLETED SUCCESSFULLY!")
+        print("INGESTION COMPLETED SUCCESSFULLY!")
         print("=" * 60)
         print("You can now run: streamlit run frontend/app.py")
         
     except Exception as e:
         print("\n" + "=" * 60)
-        print(f"\n✗ Error during ingestion: {e}")
+        print(f"Error during ingestion: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
+
 if __name__ == "__main__":
-    print("Starting ingestion pipeline...")
     main()
-
-
-
-
-
-
-
